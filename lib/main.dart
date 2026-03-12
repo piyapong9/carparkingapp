@@ -1,0 +1,424 @@
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:mqtt_client/mqtt_client.dart';
+import 'package:mqtt_client/mqtt_server_client.dart';
+import 'pages/history_page.dart';
+import 'pages/setting_page.dart';
+
+void main() {
+  runApp(const ParkingApp());
+}
+
+class ParkingApp extends StatelessWidget {
+  const ParkingApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Status Parking',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
+        useMaterial3: true,
+      ),
+      home: const ParkingDashboard(),
+    );
+  }
+}
+
+class ParkingDashboard extends StatefulWidget {
+  const ParkingDashboard({super.key});
+
+  @override
+  State<ParkingDashboard> createState() => _ParkingDashboardState();
+}
+
+class _ParkingDashboardState extends State<ParkingDashboard>
+    with SingleTickerProviderStateMixin {
+  final String clientId = '625f9968-1075-4352-b789-7ae80e5e2ff6';
+  final String token = '3ae9XUhLnn97gk8UCNFYsqrafFKf31Bc';
+  final String secret = 'cr9Pgtno9WVbFH4QeefgJzJECQ8AwMU8';
+
+  Map<String, int> parkingStatus = {'ir1': 0, 'ir2': 0, 'ir3': 0, 'ir4': 0};
+  Map<String, DateTime?> entryTimes = {
+    'ir1': null,
+    'ir2': null,
+    'ir3': null,
+    'ir4': null,
+  };
+
+  bool isConnected = false;
+  bool _isReconnecting = false;
+  bool sensorEnabled = true;
+
+  MqttServerClient? client;
+  StreamSubscription<List<MqttReceivedMessage<MqttMessage>>>? _mqttSubscription;
+  late TabController _tabController;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 3, vsync: this);
+    connectMQTT();
+  }
+
+  @override
+  void dispose() {
+    _mqttSubscription?.cancel();
+    _tabController.dispose();
+    client?.disconnect();
+    super.dispose();
+  }
+
+  Future<void> connectMQTT() async {
+    if (_isReconnecting) return;
+    _isReconnecting = true;
+
+    _mqttSubscription?.cancel();
+    client?.disconnect();
+
+    client = MqttServerClient('mqtt.netpie.io', clientId);
+    client!.port = 1883;
+    client!.keepAlivePeriod = 30;
+    client!.logging(on: false);
+    client!.setProtocolV311();
+    client!.secure = false;
+    client!.autoReconnect = false;
+    client!.resubscribeOnAutoReconnect = false;
+
+    client!.onConnected = () {
+      if (!mounted) return;
+      setState(() => isConnected = true);
+      client!.subscribe('@msg/parking', MqttQos.atMostOnce);
+      _isReconnecting = false;
+    };
+
+    client!.onDisconnected = () {
+      if (!mounted) return;
+
+      setState(() => isConnected = false);
+      _mqttSubscription?.cancel();
+      _mqttSubscription = null;
+      _isReconnecting = false;
+
+      Future.delayed(const Duration(seconds: 3), () {
+        if (mounted) {
+          connectMQTT();
+        }
+      });
+    };
+
+    final connMessage = MqttConnectMessage()
+        .withClientIdentifier(clientId)
+        .authenticateAs(token, secret)
+        .startClean();
+
+    client!.connectionMessage = connMessage;
+
+    try {
+      await client!.connect();
+    } catch (e) {
+      client?.disconnect();
+      _isReconnecting = false;
+      return;
+    }
+
+    if (client!.connectionStatus?.state != MqttConnectionState.connected) {
+      client?.disconnect();
+      _isReconnecting = false;
+      return;
+    }
+
+    _mqttSubscription = client!.updates?.listen((
+      List<MqttReceivedMessage<MqttMessage>> messages,
+    ) {
+      for (final msg in messages) {
+        final payload = msg.payload as MqttPublishMessage;
+        final text = MqttPublishPayload.bytesToStringAsString(
+          payload.payload.message,
+        );
+
+        try {
+          final json = jsonDecode(text);
+          final data = json['data'];
+
+          if (data != null) {
+            final oldStatus = Map<String, int>.from(parkingStatus);
+
+            setState(() {
+              parkingStatus['ir1'] = data['ir1'] ?? 0;
+              parkingStatus['ir2'] = data['ir2'] ?? 0;
+              parkingStatus['ir3'] = data['ir3'] ?? 0;
+              parkingStatus['ir4'] = data['ir4'] ?? 0;
+              sensorEnabled = (data['sensor_enabled'] ?? 1) == 1;
+
+              for (final key in parkingStatus.keys) {
+                if ((oldStatus[key] ?? 0) == 0 &&
+                    (parkingStatus[key] ?? 0) == 1 &&
+                    sensorEnabled) {
+                  entryTimes[key] = DateTime.now();
+
+                  if (mounted && context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(
+                          'มีรถเข้าจอดที่ช่อง ${key.replaceAll('ir', '')}',
+                        ),
+                        duration: const Duration(seconds: 2),
+                      ),
+                    );
+                  }
+                }
+
+                if ((oldStatus[key] ?? 0) == 1 &&
+                    (parkingStatus[key] ?? 0) == 0) {
+                  entryTimes[key] = null;
+                }
+              }
+
+              if (!sensorEnabled) {
+                entryTimes.updateAll((key, value) => null);
+              }
+            });
+          }
+        } catch (e) {
+          debugPrint('JSON parse error: $e');
+        }
+      }
+    });
+  }
+
+  Future<void> sendSensorCommand(bool enable) async {
+    if (client == null ||
+        client!.connectionStatus?.state != MqttConnectionState.connected) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('ยังไม่ได้เชื่อมต่อ MQTT')),
+      );
+      return;
+    }
+
+    final builder = MqttClientPayloadBuilder();
+    final payload = jsonEncode({
+      'sensor': enable ? 'on' : 'off',
+    });
+
+    builder.addString(payload);
+
+    client!.publishMessage(
+      '@msg/parking/control',
+      MqttQos.atMostOnce,
+      builder.payload!,
+    );
+
+    setState(() {
+      sensorEnabled = enable;
+      if (!enable) {
+        entryTimes.updateAll((key, value) => null);
+        parkingStatus.updateAll((key, value) => 0);
+      }
+    });
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          enable ? 'เปิดการทำงานเซนเซอร์แล้ว' : 'ปิดการทำงานเซนเซอร์แล้ว',
+        ),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final int available = parkingStatus.values.where((v) => v == 0).length;
+
+    return Scaffold(
+      backgroundColor: Colors.grey[100],
+      appBar: AppBar(
+        title: const Text(
+          'Status Parking',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        centerTitle: true,
+        backgroundColor: Colors.blue,
+        foregroundColor: Colors.white,
+        actions: [
+          Padding(
+            padding: const EdgeInsets.only(right: 16),
+            child: Icon(
+              Icons.circle,
+              color: isConnected ? Colors.greenAccent : Colors.redAccent,
+              size: 14,
+            ),
+          ),
+        ],
+        bottom: TabBar(
+          controller: _tabController,
+          indicatorColor: Colors.white,
+          indicatorWeight: 3,
+          labelColor: Colors.white,
+          unselectedLabelColor: Colors.white70,
+          tabs: const [
+            Tab(icon: Icon(Icons.dashboard), text: 'แดชบอร์ด'),
+            Tab(icon: Icon(Icons.history), text: 'ประวัติ'),
+            Tab(icon: Icon(Icons.settings), text: 'ตั้งค่า'),
+          ],
+        ),
+      ),
+      body: TabBarView(
+        controller: _tabController,
+        children: [
+          _buildDashboardBody(available),
+          const HistoryPage(),
+          SettingPage(
+            isConnected: isConnected,
+            sensorEnabled: sensorEnabled,
+            onToggleSensor: sendSensorCommand,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDashboardBody(int available) {
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        children: [
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(16),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withAlpha(25),
+                  blurRadius: 10,
+                  offset: const Offset(0, 4),
+                ),
+              ],
+            ),
+            child: Column(
+              children: [
+                const Text(
+                  'Available Parking',
+                  style: TextStyle(fontSize: 18, color: Colors.grey),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '$available / 4',
+                  style: TextStyle(
+                    fontSize: 48,
+                    fontWeight: FontWeight.bold,
+                    color: available > 0 ? Colors.green : Colors.red,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  sensorEnabled ? 'Sensor: เปิดใช้งาน' : 'Sensor: ปิดใช้งาน',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                    color: sensorEnabled ? Colors.green[700] : Colors.red[700],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 24),
+          Expanded(
+            child: GridView.count(
+              crossAxisCount: 2,
+              crossAxisSpacing: 16,
+              mainAxisSpacing: 16,
+              children: [
+                _buildSlotCard(1, parkingStatus['ir1']!),
+                _buildSlotCard(2, parkingStatus['ir2']!),
+                _buildSlotCard(3, parkingStatus['ir3']!),
+                _buildSlotCard(4, parkingStatus['ir4']!),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSlotCard(int slotNumber, int status) {
+    final bool isOccupied = status == 1;
+    final DateTime? entryTime = entryTimes['ir$slotNumber'];
+
+    return Container(
+      decoration: BoxDecoration(
+        color: isOccupied ? Colors.red[400] : Colors.green[400],
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [
+          BoxShadow(
+            color: (isOccupied ? Colors.red : Colors.green).withAlpha(76),
+            blurRadius: 12,
+            offset: const Offset(0, 6),
+          ),
+        ],
+      ),
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              isOccupied ? Icons.directions_car : Icons.check_circle_outline,
+              size: 48,
+              color: Colors.white,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'ที่จอดรถ $slotNumber',
+              style: const TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+                color: Colors.white,
+              ),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              isOccupied ? 'ไม่ว่าง' : 'ว่าง',
+              style: const TextStyle(fontSize: 15, color: Colors.white70),
+            ),
+            if (isOccupied && entryTime != null) ...[
+              const SizedBox(height: 2),
+              Text(
+                'เข้า: ${_formatDateTime(entryTime)}',
+                style: const TextStyle(fontSize: 11, color: Colors.white),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              Text(
+                'เวลาที่จอด: ${_formatDuration(DateTime.now().difference(entryTime))}',
+                style: const TextStyle(fontSize: 11, color: Colors.white),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _formatDateTime(DateTime dt) {
+    return '${dt.day.toString().padLeft(2, '0')}/${dt.month.toString().padLeft(2, '0')}/${dt.year} '
+        '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}:${dt.second.toString().padLeft(2, '0')}';
+  }
+
+  String _formatDuration(Duration d) {
+    if (d.inHours > 0) {
+      return '${d.inHours} ชม. ${d.inMinutes % 60} นาที';
+    } else {
+      return '${d.inMinutes} นาที';
+    }
+  }
+}
